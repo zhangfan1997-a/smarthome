@@ -1,64 +1,63 @@
 #ifndef DEVICE_MANAGER_H
 #define DEVICE_MANAGER_H
 
-#include "DatabaseManager/DatabaseManager.h"
-#include <memory>
-#include <vector>
-#include <unordered_map>
+#include <sqlite3.h>
+#include <string>
+#include <map>
 #include <mutex>
-#include <atomic>
+#include <memory>
 
-// 设备接口
-class Device {
-public:
-    virtual ~Device() = default;
-    virtual std::string getType() const = 0;
-    virtual std::string getStatus() const = 0;
-    virtual void control(const std::string& command) = 0;
-    virtual void updateDatabase(DatabaseManager& db) = 0;
-    virtual int getId() const = 0;
-};
-
-// 设备工厂接口
-class DeviceFactory {
-public:
-    virtual std::unique_ptr<Device> createDevice(int id, const std::string& config) = 0;
-    virtual ~DeviceFactory() = default;
-};
-
-// 设备管理器
 class DeviceManager {
 public:
-    DeviceManager(DatabaseManager& db, const std::string& configPath);
+    //设备信息
+    struct DeviceInfo {
+        int id;
+        std::string name;
+        std::string type;
+        std::string status;
+    };
     
-    void loadDevices();
-    bool addDevice(const std::string& type, const std::string& config);
-    bool removeDevice(int deviceId);
-    Device* getDevice(int deviceId);
-    std::vector<Device*> getAllDevices();
+    // 单例访问接口
+    static DeviceManager& GetInstance();
+
+    //获取设备信息
+    const DeviceInfo* GetDevice(int id) const;//只读访问
     
-    // 设备控制接口
-    bool setDeviceStatus(int deviceId, const std::string& command);
-    std::string getDeviceStatus(int deviceId);
+    // 数据库管理
+    bool Initialize(const std::string& dbPath = "devices.db");
+    void Close();
+
+    // 设备操作接口
+    bool AddDevice(int id, const std::string& name, const std::string& type);
+    bool RemoveDevice(int id);
+    bool UpdateDeviceStatus(int id, const std::string& newStatus);
+    std::string GetDeviceStatus(int id) const;
+    void ListAllDevices() const;
+
+    // 禁止拷贝和赋值
+    DeviceManager(const DeviceManager&) = delete;
+    void operator=(const DeviceManager&) = delete;
 
 private:
-    DatabaseManager& db_;
-    std::unordered_map<int, std::unique_ptr<Device>> devices_;
-    std::unordered_map<std::string, std::unique_ptr<DeviceFactory>> factories_;
-    std::mutex devicesMutex_;
-    std::atomic<int> nextDeviceId_{1};
-    
-    void registerFactory(const std::string& type, std::unique_ptr<DeviceFactory> factory);
-    void loadConfigurations(const std::string& path);
-};
+    DeviceManager() = default;
+    ~DeviceManager();
 
-// 具体设备工厂注册
-template<typename T>
-class DeviceFactoryImpl : public DeviceFactory {
-public:
-    std::unique_ptr<Device> createDevice(int id, const std::string& config) override {
-        return std::make_unique<T>(id, config);
-    }
+    struct DeviceInfo {
+        int id;
+        std::string name;
+        std::string type;
+        std::string status;
+    };
+
+    // 数据库操作
+    bool ExecuteSQL(const std::string& sql);
+    bool PrepareStatement(const std::string& sql, sqlite3_stmt** stmt);
+    void LoadFromDatabase();
+
+    sqlite3* db_ = nullptr;
+    std::map<int, DeviceInfo> devices_;
+    mutable std::mutex dbMutex_;
+    mutable std::mutex dataMutex_;
 };
 
 #endif // DEVICE_MANAGER_H

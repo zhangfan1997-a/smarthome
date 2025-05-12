@@ -1,204 +1,192 @@
-#include "UserManager/UserManager.h"
-#include <ctime>
-#include <random>
+#include "UserManager.h"
+#include <iostream>
 #include <sstream>
 #include <iomanip>
 #include <openssl/sha.h>
-#include <sqlite3.h>
-#include <algorithm>
 
 using namespace std;
 
-// 登录失败锁定策略（5次失败锁定15分钟）
-constexpr int MAX_LOGIN_ATTEMPTS = 5;
-constexpr int LOCKOUT_DURATION = 900; 
-
-UserManager::UserManager(DatabaseManager& dbManager) : db_(dbManager) {}
-
-string UserManager::hashPassword(const string& password) {
-    // 生成随机盐值
-    random_device rd;
-    array<uint8_t, 16> salt;
-    generate(salt.begin(), salt.end(), ref(rd));
-
-    // 使用PBKDF2-HMAC-SHA256进行密钥派生
-    const int iterations = 10000;
-    const int keyLength = 32;
-    vector<uint8_t> derivedKey(keyLength);
-
-    PKCS5_PBKDF2_HMAC(
-        password.c_str(), password.length(),
-        salt.data(), salt.size(),
-        iterations,
-        EVP_sha256(),
-        keyLength, derivedKey.data()
-    );
-
-    // 存储格式：算法$迭代次数$盐$密钥
-    stringstream ss;
-    ss << "pbkdf2-sha256$" << iterations << "$";
-    ss << hex << setfill('0');
-    for(auto b : salt) ss << setw(2) << (int)b;
-    ss << "$";
-    for(auto b : derivedKey) ss << setw(2) << (int)b;
-    
-    return ss.str();
+UserManager::~UserManager() {
+    Close();
 }
 
-bool UserManager::registerUser(const string& username, const string& password, const string& role) {
-    // 输入验证
-    if(username.empty() || password.empty()) return false;
-    if(role != "admin" && role != "user") return false;
-
-    lock_guard<mutex> lock(sessionMutex_);
-    
-    // 检查用户名是否已存在
-    sqlite3_stmt* stmt;
-    const char* checkSql = "SELECT 1 FROM users WHERE username = ?;";
-    if(sqlite3_prepare_v2(db_.getHandle(), checkSql, -1, &stmt, nullptr) != SQLITE_OK) {
-        cerr << "数据库错误: " << sqlite3_errmsg(db_.getHandle()) << endl;
-        return false;
-    }
-    sqlite3_bind_text(stmt, 1, username.c_str(), -1, SQLITE_STATIC);
-    
-    if(sqlite3_step(stmt) == SQLITE_ROW) {
-        sqlite3_finalize(stmt);
-        return false; // 用户已存在
-    }
-    sqlite3_finalize(stmt);
-
-    // 插入新用户
-    const char* insertSql = "INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?);";
-    if(sqlite3_prepare_v2(db_.getHandle(), insertSql, -1, &stmt, nullptr) != SQLITE_OK) {
-        cerr << "数据库错误: " << sqlite3_errmsg(db_.getHandle()) << endl;
-        return false;
-    }
-
-    string hashedPassword = hashPassword(password);
-    sqlite3_bind_text(stmt, 1, username.c_str(), -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 2, hashedPassword.c_str(), -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 3, role.c_str(), -1, SQLITE_STATIC);
-
-    bool success = (sqlite3_step(stmt) == SQLITE_DONE);
-    sqlite3_finalize(stmt);
-    
-    return success;
+UserManager& UserManager::GetInstance() {
+    static UserManager instance;
+    return instance;
 }
 
-bool UserManager::login(const string& username, const string& password, const string& ip) {
-    lock_guard<mutex> lock(sessionMutex_);
-    clearExpiredSessions();
-
-    // 检查登录失败次数
-    static map<string, pair<int, time_t>> loginAttempts;
-    auto it = loginAttempts.find(username);
-    if(it != loginAttempts.end()) {
-        if(it->second.first >= MAX_LOGIN_ATTEMPTS && 
-           time(nullptr) - it->second.second < LOCKOUT_DURATION) 
-        {
-            cerr << "账户已锁定，请稍后再试" << endl;
-            return false;
-        }
-    }
-
-    // 查询用户信息
-    sqlite3_stmt* stmt;
-    const char* sql = "SELECT password_hash, role FROM users WHERE username = ?;";
-    if(sqlite3_prepare_v2(db_.getHandle(), sql, -1, &stmt, nullptr) != SQLITE_OK) {
-        cerr << "数据库错误: " << sqlite3_errmsg(db_.getHandle()) << endl;
-        return false;
-    }
-    sqlite3_bind_text(stmt, 1, username.c_str(), -1, SQLITE_STATIC);
-
-    if(sqlite3_step(stmt) != SQLITE_ROW) {
-        sqlite3_finalize(stmt);
-        loginAttempts[username].first++;
-        loginAttempts[username].second = time(nullptr);
-        return false; // 用户不存在
-    }
-
-    // 验证密码
-    const char* storedHash = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
-    string inputHash = hashPassword(password);
+bool UserManager::Initialize(const std::string& dbPath) {
+    lock_guard<mutex> lock(dbMutex_);
     
-    if(inputHash != storedHash) {
-        sqlite3_finalize(stmt);
-        loginAttempts[username].first++;
-        loginAttempts[username].second = time(nullptr);
+    if (sqlite3_open(dbPath.c_str(), &db_) != SQLITE_OK) {
+        cerr << "数据库连接失败: " << sqlite3_errmsg(db_) << endl;
         return false;
     }
 
-    // 获取用户角色
-    string role = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
-    sqlite3_finalize(stmt);
+    const char* sql = R"(
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            role INTEGER DEFAULT 1
+        );
+        
+        CREATE TABLE IF NOT EXISTS sessions (
+            user_id INTEGER PRIMARY KEY,
+            token TEXT NOT NULL,
+            expiry INTEGER NOT NULL,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        );
+    )";
 
-    // 创建会话
-    string sessionId = generateSessionId();
-    activeSessions_[sessionId] = {
-        username,
-        role,
-        ip,
-        time(nullptr), // 登录时间
-        time(nullptr)  // 最后活动时间
-    };
+    if (!ExecuteSQL(sql)) {
+        cerr << "初始化数据库失败" << endl;
+        return false;
+    }
 
-    // 重置登录失败计数
-    loginAttempts.erase(username);
+    LoadUsersFromDB();
     return true;
 }
 
-void UserManager::logout(const string& sessionId) {
-    lock_guard<mutex> lock(sessionMutex_);
-    activeSessions_.erase(sessionId);
+void UserManager::Close() {
+    lock_guard<mutex> lock(dbMutex_);
+    if (db_) {
+        sqlite3_close(db_);
+        db_ = nullptr;
+    }
 }
 
-bool UserManager::validateSession(const string& sessionId) {
-    lock_guard<mutex> lock(sessionMutex_);
-    auto it = activeSessions_.find(sessionId);
-    if(it == activeSessions_.end()) return false;
-
-    // 检查会话超时
-    if(time(nullptr) - it->second.lastActivity > SESSION_TIMEOUT) {
-        activeSessions_.erase(it);
+bool UserManager::ExecuteSQL(const std::string& sql) {
+    lock_guard<mutex> lock(dbMutex_);
+    char* errMsg = nullptr;
+    if (sqlite3_exec(db_, sql.c_str(), nullptr, nullptr, &errMsg) != SQLITE_OK) {
+        cerr << "SQL错误: " << errMsg << endl;
+        sqlite3_free(errMsg);
         return false;
     }
-
-    // 更新最后活动时间
-    it->second.lastActivity = time(nullptr);
     return true;
 }
 
-string UserManager::getCurrentUserRole(const string& sessionId) {
-    lock_guard<mutex> lock(sessionMutex_);
-    auto it = activeSessions_.find(sessionId);
-    return (it != activeSessions_.end()) ? it->second.role : "";
+bool UserManager::PrepareStatement(const std::string& sql, sqlite3_stmt** stmt) {
+    lock_guard<mutex> lock(dbMutex_);
+    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, stmt, nullptr) != SQLITE_OK) {
+        cerr << "准备语句失败: " << sqlite3_errmsg(db_) << endl;
+        return false;
+    }
+    return true;
 }
 
-string UserManager::generateSessionId() {
-    // 使用CryptoPP生成密码学安全的随机数
-    random_device rd;
-    array<uint8_t, 32> randomData;
-    generate(randomData.begin(), randomData.end(), ref(rd));
+void UserManager::LoadUsersFromDB() {
+    lock_guard<mutex> dataLock(dataMutex_);
+    users_.clear();
+
+    sqlite3_stmt* stmt;
+    if (!PrepareStatement("SELECT id, username, password_hash, role FROM users;", &stmt)) return;
+
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        int id = sqlite3_column_int(stmt, 0);
+        string username(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1)));
+        string password_hash(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2)));
+        User::Role role = static_cast<User::Role>(sqlite3_column_int(stmt, 3));
+        
+        users_.emplace(id, User(id, username, password_hash, role));
+    }
+    sqlite3_finalize(stmt);
+}
+
+string UserManager::HashPassword(const string& password) const {
+    unsigned char hash[SHA256_DIGEST_LENGTH];
+    SHA256(reinterpret_cast<const unsigned char*>(password.c_str()), 
+          password.length(), hash);
 
     stringstream ss;
-    ss << hex << setfill('0');
-    for(auto b : randomData) {
-        ss << setw(2) << static_cast<int>(b);
+    for (int i = 0; i < SHA256_DIGEST_LENGTH; ++i) {
+        ss << hex << setw(2) << setfill('0') << static_cast<int>(hash[i]);
     }
     return ss.str();
 }
 
-void UserManager::clearExpiredSessions() {
-    time_t now = time(nullptr);
-    vector<string> expiredSessions;
+bool UserManager::RegisterUser(const string& username, const string& password) {
+    string hashedPassword = HashPassword(password);
+    
+    // 数据库操作
+    stringstream sql;
+    sql << "INSERT INTO users (username, password_hash) VALUES ('"
+        << username << "', '" << hashedPassword << "');";
+    
+    if (!ExecuteSQL(sql.str())) return false;
 
-    for(const auto& [sessionId, session] : activeSessions_) {
-        if(now - session.lastActivity > SESSION_TIMEOUT) {
-            expiredSessions.push_back(sessionId);
+    // 重新加载用户数据
+    LoadUsersFromDB();
+    return true;
+}
+
+bool UserManager::LoginUser(const std::string& username, const std::string& password) {
+    lock_guard<mutex> dataLock(dataMutex_);
+    
+    for (auto& [id, user] : users_) {
+        if (user.getUsername() == username) {
+            if (user.getPasswordHash() == HashPassword(password)) {
+                // 生成会话令牌
+                Session session;
+                session.token = HashPassword(username + to_string(time(nullptr)));
+                session.expiry = time(nullptr) + 3600;
+
+                // 更新会话和当前用户
+                sessions_[id] = session;
+                currentUserId_ = id;  // 设置当前用户ID
+
+                // 保存到数据库
+                stringstream sql;
+                sql << "INSERT OR REPLACE INTO sessions VALUES ("
+                    << id << ", '" << session.token << "', " << session.expiry << ");";
+                return ExecuteSQL(sql.str());
+            }
+            break;
         }
     }
-
-    for(const auto& sessionId : expiredSessions) {
-        activeSessions_.erase(sessionId);
-    }
+    return false;
 }
+
+void UserManager::LogoutUser(int userId) {
+    lock_guard<mutex> dataLock(dataMutex_);
+    sessions_.erase(userId);
+    
+    // 如果登出的是当前用户，则重置
+    if (currentUserId_ == userId) {
+        currentUserId_ = -1;
+    }
+
+    stringstream sql;
+    sql << "DELETE FROM sessions WHERE user_id = " << userId << ";";
+    ExecuteSQL(sql.str());
+}
+
+User* UserManager::GetUser(int userId) {
+    lock_guard<mutex> dataLock(dataMutex_);
+    auto it = users_.find(userId);
+    return it != users_.end() ? &it->second : nullptr;
+}
+
+User* UserManager::GetCurrentUser() {
+    std::lock_guard<std::mutex> lock(dataMutex_);
+    
+    // 检查是否已登录
+    if (currentUserId_ == -1) {
+        return nullptr;
+    }
+
+    // 检查会话是否存在且未过期
+    auto sessionIt = sessions_.find(currentUserId_);
+    if (sessionIt == sessions_.end() || sessionIt->second.expiry < time(nullptr)) {
+        currentUserId_ = -1;  // 会话无效则重置
+        return nullptr;
+    }
+
+    // 返回用户对象
+    auto userIt = users_.find(currentUserId_);
+    return (userIt != users_.end()) ? &userIt->second : nullptr;
+}
+
+
+UserManager::~UserManager() { Close(); }

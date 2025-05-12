@@ -2,70 +2,44 @@
 #define LOG_MANAGER_H
 
 #include <string>
-#include <queue>
+#include <vector>
 #include <mutex>
-#include <atomic>
-#include <condition_variable>
 #include <fstream>
-#include <chrono>
-#include <ctime>
-#include <filesystem>
-
-namespace fs = std::filesystem;
 
 class LogManager {
 public:
-    enum class LogType {
-        USER_ACTION,
-        DEVICE_OPERATION,
-        SYSTEM_EVENT,
-        ERROR_LOG
-    };
-
-    static LogManager& getInstance();
-    
-    void init(const std::string& logDir = "logs", 
-             size_t maxFileSize = 10'485'760,  // 10MB
-             int maxBackups = 5);
-    
-    void log(LogType type, 
-            const std::string& message, 
-            int userId = -1, 
-            int deviceId = -1);
-    
-    void flush();
-    void shutdown();
-
-private:
-    LogManager() = default;
-    ~LogManager();
+    enum class LogType { UserAction, DeviceAction, System };
     
     struct LogEntry {
-        std::time_t timestamp;
         LogType type;
-        std::string message;
         int userId;
         int deviceId;
+        std::string content;
+        std::string timestamp;
     };
 
-    std::queue<LogEntry> logQueue_;
-    std::mutex queueMutex_;
-    std::condition_variable cv_;
-    std::atomic<bool> running_{false};
+    // 单例访问方法
+    static LogManager& GetInstance();
     
-    fs::path logDir_;
-    std::ofstream logFile_;
-    size_t currentFileSize_;
-    size_t maxFileSize_;
-    int maxBackups_;
+    // 日志记录接口
+    void logAction(LogType type, int userId, int deviceId, const std::string& content);
     
-    std::thread workerThread_;
+    // 日志持久化
+    void saveLogsToFile(const std::string& filename);
     
-    void workerFunction();
-    void rotateLog();
-    std::string getTypeString(LogType type) const;
-    void writeBatch(const std::vector<LogEntry>& batch);
-    void createNewLogFile();
+    // 禁止拷贝和赋值
+    LogManager(const LogManager&) = delete;
+    void operator=(const LogManager&) = delete;
+
+private:
+    LogManager() = default;  // 私有构造函数
+    ~LogManager() = default;
+    
+    std::string formatLogEntry(const LogEntry& entry) const;
+    std::string logTypeToString(LogType type) const;
+    
+    std::vector<LogEntry> logs_;
+    mutable std::mutex logMutex_;
 };
 
 #endif // LOG_MANAGER_H
