@@ -6,6 +6,7 @@
 #include <map>
 #include <mutex>
 #include <ctime>
+#include <memory> //包括智能指针
 
 class User {
 public:
@@ -39,7 +40,7 @@ public:
     bool LoginUser(const std::string& username, const std::string& password);
     void LogoutUser(int userId);
     User* GetUser(int userId);
-    User* GetCurrentUser();//获取当前登陆用户
+    User* GetCurrentUser(); // 获取当前登录用户
     
     // 禁止拷贝和赋值
     UserManager(const UserManager&) = delete;
@@ -53,7 +54,8 @@ private:
         std::string token;
         time_t expiry;
     };
-    int currentUserId_=-1;//当前用户ID，-1表示未登录
+    int currentUserId_ = -1; // 当前用户ID，-1表示未登录
+    
     // 数据库操作
     bool ExecuteSQL(const std::string& sql);
     bool PrepareStatement(const std::string& sql, sqlite3_stmt** stmt);
@@ -64,7 +66,7 @@ private:
     std::map<int, User> users_;
     std::map<int, Session> sessions_;
     mutable std::mutex dbMutex_;
-    mutable std::mutex dataMutex_;
+    mutable std::mutex dataMutex_; // 用于保护users_, sessions_和currentUserId_
 };
 
 #endif // USER_MANAGER_H

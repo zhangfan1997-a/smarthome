@@ -3,6 +3,7 @@
 #include <sstream>
 #include <iomanip>
 #include <openssl/sha.h>
+#include <cstring> // 用于strerror
 
 using namespace std;
 
@@ -109,16 +110,21 @@ string UserManager::HashPassword(const string& password) const {
 bool UserManager::RegisterUser(const string& username, const string& password) {
     string hashedPassword = HashPassword(password);
     
-    // 数据库操作
-    stringstream sql;
-    sql << "INSERT INTO users (username, password_hash) VALUES ('"
-        << username << "', '" << hashedPassword << "');";
+    // 使用参数化查询防止SQL注入
+    sqlite3_stmt* stmt;
+    const char* sql = "INSERT INTO users (username, password_hash) VALUES (?, ?);";
+    if (!PrepareStatement(sql, &stmt)) return false;
     
-    if (!ExecuteSQL(sql.str())) return false;
-
-    // 重新加载用户数据
-    LoadUsersFromDB();
-    return true;
+    sqlite3_bind_text(stmt, 1, username.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, hashedPassword.c_str(), -1, SQLITE_TRANSIENT);
+    
+    bool success = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    
+    if (success) {
+        LoadUsersFromDB(); // 重新加载用户数据
+    }
+    return success;
 }
 
 bool UserManager::LoginUser(const std::string& username, const std::string& password) {
@@ -130,17 +136,23 @@ bool UserManager::LoginUser(const std::string& username, const std::string& pass
                 // 生成会话令牌
                 Session session;
                 session.token = HashPassword(username + to_string(time(nullptr)));
-                session.expiry = time(nullptr) + 3600;
+                session.expiry = time(nullptr) + 3600; // 1小时有效
 
                 // 更新会话和当前用户
                 sessions_[id] = session;
                 currentUserId_ = id;  // 设置当前用户ID
 
-                // 保存到数据库
-                stringstream sql;
-                sql << "INSERT OR REPLACE INTO sessions VALUES ("
-                    << id << ", '" << session.token << "', " << session.expiry << ");";
-                return ExecuteSQL(sql.str());
+                // 使用参数化查询保存会话
+                sqlite3_stmt* stmt;
+                const char* sql = "INSERT OR REPLACE INTO sessions VALUES (?, ?, ?);";
+                if (PrepareStatement(sql, &stmt)) {
+                    sqlite3_bind_int(stmt, 1, id);
+                    sqlite3_bind_text(stmt, 2, session.token.c_str(), -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_int64(stmt, 3, session.expiry);
+                    sqlite3_step(stmt);
+                    sqlite3_finalize(stmt);
+                    return true;
+                }
             }
             break;
         }
@@ -157,9 +169,14 @@ void UserManager::LogoutUser(int userId) {
         currentUserId_ = -1;
     }
 
-    stringstream sql;
-    sql << "DELETE FROM sessions WHERE user_id = " << userId << ";";
-    ExecuteSQL(sql.str());
+    // 使用参数化查询删除会话
+    sqlite3_stmt* stmt;
+    const char* sql = "DELETE FROM sessions WHERE user_id = ?;";
+    if (PrepareStatement(sql, &stmt)) {
+        sqlite3_bind_int(stmt, 1, userId);
+        sqlite3_step(stmt);
+        sqlite3_finalize(stmt);
+    }
 }
 
 User* UserManager::GetUser(int userId) {
@@ -185,7 +202,5 @@ User* UserManager::GetCurrentUser() {
 
     // 返回用户对象
     auto userIt = users_.find(currentUserId_);
-    return (userIt != users_.end()) ? &userIt->second : nullptr;
+    return userIt != users_.end() ? &userIt->second : nullptr;
 }
-
-
